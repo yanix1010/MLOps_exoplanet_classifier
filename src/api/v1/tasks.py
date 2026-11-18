@@ -10,7 +10,9 @@ from aio_pika.exceptions import DeliveryError, PublishError
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from faststream.rabbit import Channel, RabbitBroker
+from opentelemetry import trace
 from pydantic import BaseModel, Field
+from structlog.contextvars import bound_contextvars
 
 from src.config import (
     PUBLISH_TIMEOUT_SECONDS,
@@ -18,7 +20,7 @@ from src.config import (
     RETRY_AFTER_SECONDS,
 )
 from src.db import create_pending_task, get_db_pool, get_task
-from src.messaging import declare_topology, tasks_queue
+from src.messaging import declare_topology, publish_task
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
@@ -95,63 +97,57 @@ async def get_or_create_broker(request: Request) -> RabbitBroker:
 )
 async def create_task(payload: TaskCreateRequest, request: Request) -> Response:
     task_id = str(uuid.uuid4())
-    message = {
-        "task_id": task_id,
-        "features": payload.features,
-        "enqueued_at": time.time(),
-    }
-
-    try:
-        broker = await get_or_create_broker(request)
-        await broker.publish(
-            message,
-            queue=tasks_queue,
-            persist=True,
-            timeout=PUBLISH_TIMEOUT_SECONDS,
-        )
-    except (DeliveryError, PublishError, aiormq.exceptions.DeliveryError) as exc:
-        logger.warning(
-            "load_shedding_503_triggered",
-            task_id=task_id,
-            retry_after=RETRY_AFTER_SECONDS,
-            error=str(exc),
-        )
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
-            content={
-                "detail": "Queue is full, system overloaded (Load Shedding)",
-                "retry_after": RETRY_AFTER_SECONDS,
-            },
-        )
-    except (OSError, RuntimeError, aiormq.exceptions.AMQPError) as exc:
-        logger.error("rabbit_publish_failed", error=str(exc))
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
-            content={
-                "detail": "Message broker unavailable",
-                "retry_after": RETRY_AFTER_SECONDS,
-            },
-        )
-
-    try:
-        pool = await get_db_pool()
-        await create_pending_task(pool, task_id, payload.features)
-    except (OSError, RuntimeError, asyncpg.PostgresError) as exc:
-        logger.warning(
-            "db_task_pending_creation_warning", task_id=task_id, error=str(exc)
-        )
-
-    logger.info("task_enqueued_successfully", task_id=task_id)
-    return JSONResponse(
-        status_code=status.HTTP_202_ACCEPTED,
-        content={
+    trace.get_current_span().set_attribute("task.id", task_id)
+    with bound_contextvars(task_id=task_id):
+        message = {
             "task_id": task_id,
-            "status": "PENDING",
-            "message": "Task accepted for processing",
-        },
-    )
+            "features": payload.features,
+            "enqueued_at": time.time(),
+        }
+
+        try:
+            broker = await get_or_create_broker(request)
+            await publish_task(broker, message, timeout=PUBLISH_TIMEOUT_SECONDS)
+        except (DeliveryError, PublishError, aiormq.exceptions.DeliveryError) as exc:
+            logger.warning(
+                "load_shedding_503_triggered",
+                retry_after=RETRY_AFTER_SECONDS,
+                exc_info=exc,
+            )
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+                content={
+                    "detail": "Queue is full, system overloaded (Load Shedding)",
+                    "retry_after": RETRY_AFTER_SECONDS,
+                },
+            )
+        except (OSError, RuntimeError, aiormq.exceptions.AMQPError) as exc:
+            logger.error("rabbit_publish_failed", exc_info=exc)
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+                content={
+                    "detail": "Message broker unavailable",
+                    "retry_after": RETRY_AFTER_SECONDS,
+                },
+            )
+
+        try:
+            pool = await get_db_pool()
+            await create_pending_task(pool, task_id, payload.features)
+        except (OSError, RuntimeError, asyncpg.PostgresError) as exc:
+            logger.warning("db_task_pending_creation_warning", exc_info=exc)
+
+        logger.info("task_enqueued_successfully")
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "task_id": task_id,
+                "status": "PENDING",
+                "message": "Task accepted for processing",
+            },
+        )
 
 
 @router.get("/{task_id}", response_model=TaskDetailResponse)
@@ -160,7 +156,7 @@ async def get_task_status(task_id: uuid.UUID) -> dict[str, Any]:
         pool = await get_db_pool()
         task = await get_task(pool, task_id)
     except (OSError, RuntimeError, asyncpg.PostgresError) as exc:
-        logger.error("db_get_task_failed", task_id=str(task_id), error=str(exc))
+        logger.error("db_get_task_failed", task_id=str(task_id), exc_info=exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Database error while fetching task status",

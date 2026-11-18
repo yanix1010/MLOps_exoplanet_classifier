@@ -11,6 +11,7 @@ import aiormq.exceptions
 import structlog
 from aio_pika.exceptions import DeliveryError, PublishError
 from faststream.rabbit import Channel, RabbitBroker
+from structlog.contextvars import bound_contextvars
 
 from src.config import (
     PRODUCER_BACKOFF_FACTOR,
@@ -24,7 +25,17 @@ from src.config import (
     RABBITMQ_URL,
     RAW_DATA_PATH,
 )
-from src.messaging import declare_topology, tasks_queue
+from src.messaging import declare_topology, publish_task
+from src.telemetry import (
+    configure_logging,
+    configure_telemetry,
+    operation,
+    producer_wait,
+    rejections,
+)
+from src.telemetry import (
+    published as published_tasks,
+)
 
 logger = structlog.get_logger()
 
@@ -110,7 +121,6 @@ async def publish_batch(
         file_path=str(file_path),
         queue_max_length=QUEUE_MAX_LENGTH,
         queue_overflow=QUEUE_OVERFLOW,
-        broker_url=broker_url,
     )
 
     channel = Channel(publisher_confirms=True)
@@ -129,42 +139,53 @@ async def publish_batch(
             if max_tasks is not None and total_published >= max_tasks:
                 break
 
-            published = False
-            while not published:
-                try:
-                    task["enqueued_at"] = time.time()
-                    await broker.publish(task, queue=tasks_queue, persist=True)
-                    published = True
-                    total_published += 1
-                    current_delay = backoff.on_success()
+            with (
+                bound_contextvars(task_id=task["task_id"]),
+                operation(
+                    "produce task", attributes={"task.id": task["task_id"]}
+                ) as span,
+            ):
+                published = False
+                while not published:
+                    try:
+                        task["enqueued_at"] = time.time()
+                        await publish_task(broker, task)
+                        published_tasks.add(1)
+                        published = True
+                        total_published += 1
+                        current_delay = backoff.on_success()
 
-                    if total_published % 20 == 0 or total_rejections > 0:
-                        logger.info(
-                            "task_published",
-                            task_id=task["task_id"],
-                            total_published=total_published,
-                            total_rejections=total_rejections,
-                            adaptive_delay_sec=round(current_delay, 4),
+                        if total_published % 20 == 0 or total_rejections > 0:
+                            logger.info(
+                                "task_published",
+                                total_published=total_published,
+                                total_rejections=total_rejections,
+                                adaptive_delay_sec=round(current_delay, 4),
+                            )
+
+                        if current_delay > 0:
+                            await asyncio.sleep(current_delay)
+
+                    except (
+                        DeliveryError,
+                        PublishError,
+                        aiormq.exceptions.DeliveryError,
+                    ):
+                        total_rejections += 1
+                        rejections.add(1)
+                        current_delay = backoff.on_rejected()
+                        logger.warning(
+                            "queue_overflow_backpressure_signal",
+                            rejection_count=total_rejections,
+                            adaptive_backoff_delay_sec=round(current_delay, 4),
                         )
-
-                    if current_delay > 0:
-                        await asyncio.sleep(current_delay)
-
-                except (
-                    DeliveryError,
-                    PublishError,
-                    aiormq.exceptions.DeliveryError,
-                ):
-                    total_rejections += 1
-                    current_delay = backoff.on_rejected()
-                    logger.warning(
-                        "queue_overflow_backpressure_signal",
-                        task_id=task["task_id"],
-                        rejection_count=total_rejections,
-                        adaptive_backoff_delay_sec=round(current_delay, 4),
-                        action="Waiting for worker before retrying the same task",
-                    )
-                    await asyncio.sleep(current_delay)
+                        span.add_event(
+                            "broker_rejected", {"retry.delay.seconds": current_delay}
+                        )
+                        started = time.perf_counter()
+                        with operation("producer backpressure wait"):
+                            await asyncio.sleep(current_delay)
+                        producer_wait.add(time.perf_counter() - started)
 
     finally:
         await broker.stop()
@@ -178,6 +199,8 @@ async def publish_batch(
 
 
 def main() -> None:
+    configure_logging("producer")
+    configure_telemetry("producer")
     max_tasks_env = os.getenv("MAX_TASKS")
     max_tasks = int(max_tasks_env) if max_tasks_env else None
     asyncio.run(publish_batch(max_tasks=max_tasks))

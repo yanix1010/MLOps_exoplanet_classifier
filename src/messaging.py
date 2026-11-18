@@ -1,4 +1,6 @@
 from faststream.rabbit import RabbitBroker, RabbitQueue
+from opentelemetry.propagate import inject
+from opentelemetry.trace import SpanKind
 
 from src.config import (
     DLQ_NAME,
@@ -7,6 +9,7 @@ from src.config import (
     QUEUE_OVERFLOW,
     TASKS_QUEUE_NAME,
 )
+from src.telemetry import operation
 
 
 def build_tasks_queue_arguments(
@@ -39,3 +42,24 @@ dlq_queue = RabbitQueue(name=DLQ_NAME, durable=True)
 async def declare_topology(broker: RabbitBroker) -> None:
     await broker.declare_queue(dlq_queue)
     await broker.declare_queue(tasks_queue)
+
+
+async def publish_task(broker: RabbitBroker, task: dict, **options) -> None:
+    with operation(
+        "tasks publish",
+        kind=SpanKind.PRODUCER,
+        attributes={
+            "messaging.system": "rabbitmq",
+            "messaging.destination.name": tasks_queue.name,
+        },
+    ):
+        headers: dict[str, str] = {}
+        inject(headers)
+        await broker.publish(
+            task,
+            queue=tasks_queue,
+            persist=True,
+            headers=headers,
+            correlation_id=task["task_id"],
+            **options,
+        )

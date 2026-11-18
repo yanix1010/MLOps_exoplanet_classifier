@@ -84,7 +84,7 @@ async def load_model_with_retries() -> ModelService | None:
                 "model_load_failed",
                 attempt=attempt,
                 attempts=MODEL_LOAD_ATTEMPTS,
-                error=str(exc),
+                exc_info=exc,
             )
             if attempt < MODEL_LOAD_ATTEMPTS:
                 await asyncio.sleep(MODEL_LOAD_DELAY_SECONDS)

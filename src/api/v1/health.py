@@ -35,11 +35,11 @@ async def detailed_health_check() -> JSONResponse:
     except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
         db_status = "unavailable"
         error_detail = str(exc)
-        logger.error("database_connection_failed", error=error_detail)
+        logger.error("database_connection_failed", exc_info=exc)
 
     latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
-    logger.info(
+    logger.debug(
         "health_check_completed",
         db_status=db_status,
         latency_ms=latency_ms,

@@ -58,7 +58,7 @@ async def init_db() -> None:
             await conn.execute(CREATE_TABLE_SQL)
         logger.info("db_schema_initialized", table="tasks")
     except (OSError, asyncpg.PostgresError) as exc:
-        logger.warning("db_init_skipped_or_failed", error=str(exc))
+        logger.warning("db_init_skipped_or_failed", exc_info=exc)
 
 
 async def create_pending_task(

@@ -128,6 +128,8 @@ async def test_publish_batch_with_rejections(tmp_path: Path):
 def test_main():
     with (
         patch.dict("os.environ", {"MAX_TASKS": "5"}),
+        patch("src.batch_producer.configure_logging"),
+        patch("src.batch_producer.configure_telemetry"),
         patch("src.batch_producer.publish_batch", new=AsyncMock()) as mock_pub,
     ):
         main()

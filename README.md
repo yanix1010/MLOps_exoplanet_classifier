@@ -38,6 +38,7 @@ Exoplanet Classifier решает эту задачу: по данным наб�
 - логирование через structlog
 - MLflow: Tracking Server, EDA, отслеживание датасета, эксперименты, Model Registry
 - `POST /api/v1/tasks`: асинхронное предсказание через очередь RabbitMQ и воркер с моделью из MLflow
+- [наблюдаемость конвейера](#наблюдаемость): централизованные логи в Loki, сквозные трейсы в Tempo, метрики Prometheus, дашборд и алерты в Grafana
 
 ## Технологии
 
@@ -324,38 +325,6 @@ confirms. Когда очередь полна, брокер отвечает о
 - **Сбой брокера.** Очередь надёжная, сообщения сохраняются на диск (`persist=True`), данные лежат в
   томе `rabbitmq_data`. Брокер подтверждает публикацию только после записи.
 
-### Как показать на защите
-
-```bash
-# Воркер отвечает во время обработки
-docker compose exec worker python -c "import urllib.request as u; print(u.urlopen('http://localhost:8001/healthz').read())"
-
-# 503: без воркера очередь точно заполнится
-docker compose stop worker
-MAX_TASKS=50 uv run python -m src.batch_producer
-curl -i -X POST http://localhost:8000/api/v1/tasks -H 'Content-Type: application/json' -d '{"features": {"koi_period": 1}}'
-docker compose start worker
-
-# Второй воркер и другой prefetch (команда без --scale оставляет одного воркера)
-docker compose up -d --scale worker=2
-PREFETCH_COUNT=4 docker compose up -d --scale worker=2 worker
-
-# Другой лимит очереди. Аргументы существующей очереди менять нельзя, сначала её удаляем
-docker compose stop worker app
-docker compose exec rabbitmq rabbitmqctl delete_queue tasks
-QUEUE_MAX_LENGTH=20 docker compose up -d worker app
-QUEUE_MAX_LENGTH=20 uv run python -m src.batch_producer
-
-# Завершить воркер: штатно и аварийно
-docker compose stop worker
-docker compose start worker
-docker compose kill worker
-docker compose start worker
-
-# Заведомо некорректное сообщение: оно окажется в tasks_dlq, воркер продолжит работу
-docker compose exec rabbitmq rabbitmqadmin publish routing_key=tasks payload='not json'
-```
-
 ### Тесты
 
 `uv run pytest`: unit-тесты через `TestRabbitBroker` и интеграционные тесты в
@@ -427,3 +396,51 @@ uv run python scripts/plot_experiment.py
 
 Зависимости разделены на группы: основные нужны приложению и попадают в Docker-образ, группы `dev`
 (проверки) и `train` (EDA и обучение) ставятся командой `uv sync` и в образ не входят.
+
+## Наблюдаемость
+
+Дашборд **«Конвейер»** в Grafana показывает, что происходит с системой под нагрузкой и где находится конкретная задача. По `task_id` можно найти записи API, источника и воркера. Связь по `trace_id` позволяет перейти из лога к трейсу и обратно.
+
+| Сигнал | Сбор и хранение | Что показывает |
+| --- | --- | --- |
+| Логи | structlog → Alloy → Loki | Публикация задач, переполнение очереди, повторные доставки и ошибки |
+| Трейсы | OpenTelemetry SDK → Collector → Tempo | Путь от публикации через RabbitMQ до inference и записи в PostgreSQL |
+| Метрики | Collector и RabbitMQ → Prometheus | Глубина очередей, скорость обработки, p50/p95/p99, RSS процессов и доля ответов `503` |
+
+### Инженерные решения
+
+- `task_id` передаётся как AMQP `correlation_id`, а контекст трейса — в заголовке W3C `traceparent`. В трейсе видны ожидание задачи, номер доставки, alias и версия модели.
+- Источник отправляет метрики по OTLP, чтобы успеть передать итоговые счётчики при завершении. Prometheus отдельно считывает глубину очередей и число неподтверждённых сообщений с RabbitMQ.
+- Идентификаторы задач и трейсов доступны для поиска в логах. Лейблы метрик ограничены полями с небольшим числом значений. Гистограмма inference создаёт 14 временных рядов на воркер.
+- Collector ограничивает потребление памяти перед пакетированием. В учебном стенде используется `parentbased_always_on`, чтобы можно было найти трейс любой отправленной задачи.
+
+### Результаты проверки
+
+| Сценарий | Наблюдение |
+| --- | --- |
+| Успешная задача | В одном трейсе видны HTTP-запрос, публикация, обработка воркером, inference и запись в БД |
+| Полная очередь | API вернул `503` с `Retry-After: 5`. При заполнении выше 90% дольше минуты сработал алерт |
+| Задача с ошибкой | В трейсе видны три доставки. Задача получила статус `FAILED`, сообщение попало в DLQ и сработал алерт |
+| Память стека | Около **319 МиБ** на шесть контейнеров при заполненной очереди по `docker stats --no-stream`. Суммарный лимит — **1 232 МиБ** |
+
+### Запуск
+
+Профиль `observability` подключает стек к основному конвейеру. Для запуска можно также выбрать отдельные профили `logs`, `traces` и `metrics`. Обычный запуск Compose оставляет стек выключенным.
+
+```bash
+docker compose --env-file observability/otel.env --profile observability up -d --build
+```
+
+### Графики со стенда
+
+**Дашборд Grafana во время нагрузочной проверки.** После остановки воркера очередь достигла 50 сообщений. После его запуска на графике появилась скорость обработки, а очередь опустела.
+
+![Скриншот Grafana с графиками глубины очереди, скорости конвейера и времени inference](docs/observability/grafana-dashboard.jpg)
+
+**Детальные замеры Prometheus и Tempo**
+
+![Замеры Prometheus во время переполнения RabbitMQ. Очередь достигает 50 сообщений, API возвращает HTTP 503, а источник получает отказы при публикации.](docs/observability/rabbitmq-overload.png)
+
+![Трейс из Tempo. Ожидание задачи заняло 9,76 секунды, inference — 554 миллисекунды, запись в PostgreSQL — 5,4 миллисекунды.](docs/observability/task-trace.png)
+
+*Время inference в этом запуске включает настроенную задержку 0,5 с.*

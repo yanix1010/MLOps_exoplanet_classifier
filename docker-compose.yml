@@ -1,3 +1,13 @@
+name: mlops_exoplanet_classifier
+
+x-telemetry-env: &telemetry-env
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp}
+  OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-otlp}
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_always_on}
+  OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment.name=local}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -39,6 +49,8 @@ services:
     ports:
       - "8000:8000"
     environment:
+      <<: *telemetry-env
+      OTEL_SERVICE_NAME: app
       DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/exoplanet_classifier"
       PORT: 8000
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
@@ -72,6 +84,8 @@ services:
     expose:
       - "8001"
     environment:
+      <<: *telemetry-env
+      OTEL_SERVICE_NAME: worker
       DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/exoplanet_classifier"
       MLFLOW_TRACKING_URI: "http://mlflow_server:5000"
       MODEL_NAME: "kepler_exoplanet_classifier"
@@ -97,6 +111,31 @@ services:
           memory: 512M
     logging:
       driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  producer:
+    profiles: [batch]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.batch_producer"]
+    environment:
+      <<: *telemetry-env
+      OTEL_SERVICE_NAME: producer
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      QUEUE_MAX_LENGTH: "${QUEUE_MAX_LENGTH:-50}"
+      MAX_TASKS: "${MAX_TASKS:-}"
+    volumes:
+      - ./data/raw:/app/data/raw:ro
+    networks: [exoplanet_network]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    mem_limit: 192m
+    logging:
+      driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
@@ -152,6 +191,7 @@ services:
       RABBITMQ_DEFAULT_PASS: guest
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+      - ./observability/rabbitmq-plugins:/etc/rabbitmq/enabled_plugins:ro
     networks:
       - exoplanet_network
     healthcheck:
@@ -159,6 +199,100 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  otel-collector:
+    profiles: [observability, traces, metrics]
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    command: ["--config=/etc/otelcol/collector.yml"]
+    volumes:
+      - ./observability/collector.yml:/etc/otelcol/collector.yml:ro
+    ports:
+      - "127.0.0.1:13133:13133"
+    networks: [exoplanet_network]
+    mem_limit: 144m
+
+  tempo:
+    profiles: [observability, traces]
+    image: grafana/tempo:2.7.2
+    command: ["-config.file=/etc/tempo.yml"]
+    volumes:
+      - ./observability/tempo.yml:/etc/tempo.yml:ro
+      - tempo_data:/var/tempo
+    networks: [exoplanet_network]
+    mem_limit: 192m
+
+  loki:
+    profiles: [observability, logs]
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki.yml"]
+    volumes:
+      - ./observability/loki.yml:/etc/loki.yml:ro
+      - loki_data:/loki
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3100/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [exoplanet_network]
+    mem_limit: 256m
+
+  alloy:
+    profiles: [observability, logs]
+    image: grafana/alloy:v1.8.2
+    command: ["run", "--storage.path=/var/lib/alloy", "/etc/alloy/config.alloy"]
+    environment:
+      OBSERVABILITY_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME}
+    volumes:
+      - ./observability/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks: [exoplanet_network]
+    mem_limit: 192m
+
+  prometheus:
+    profiles: [observability, metrics]
+    image: prom/prometheus:v3.3.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      - --storage.tsdb.retention.size=512MB
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [exoplanet_network]
+    mem_limit: 192m
+
+  grafana:
+    profiles: [observability, logs, traces, metrics]
+    image: grafana/grafana:11.6.0
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [exoplanet_network]
+    mem_limit: 256m
 
 networks:
   exoplanet_network:
@@ -168,3 +302,8 @@ volumes:
   postgres_data:
   mlflow_db_data:
   rabbitmq_data:
+  alloy_data:
+  grafana_data:
+  loki_data:
+  prometheus_data:
+  tempo_data:
